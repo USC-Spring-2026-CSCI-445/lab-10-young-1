@@ -131,13 +131,23 @@ class RrtPlanner:
     def _randomly_sample_q(self) -> Node:
         # Choose uniform randomly sampled points
         ######### Your code starts here #########
-
+        x_min, x_max, y_min, y_max = self.map_aabb
+        x = np.random.uniform(x_min, x_max)
+        y = np.random.uniform(y_min, y_max)
+        return Node(np.array([x, y]), None)
         ######### Your code ends here #########
 
     def _nearest_vertex(self, graph: List[Node], q: Node) -> Node:
         # Determine vertex nearest to sampled point
         ######### Your code starts here #########
-
+        nearest = None
+        min_dist = inf
+        for node in graph:
+            d = node.distance_to(q)
+            if d < min_dist:
+                min_dist = d
+                nearest = node
+        return nearest
         ######### Your code ends here #########
 
     def _is_in_collision(self, q_rand: Node):
@@ -154,10 +164,28 @@ class RrtPlanner:
         return False
 
     def _extend(self, graph: List[Node], q_rand: Node):
-
         # Check if sampled point is in collision and add to tree if not
         ######### Your code starts here #########
+        if self._is_in_collision(q_rand):
+            return
 
+        q_near = self._nearest_vertex(graph, q_rand)
+        dist = q_near.distance_to(q_rand)
+
+        if dist <= self.delta:
+            q_new = q_rand
+        else:
+            direction = (q_rand.position - q_near.position) / dist
+            new_pos = q_near.position + self.delta * direction
+            q_new = Node(new_pos, None)
+
+        if self._is_in_collision(q_new):
+            return
+
+        q_new.parent = q_near
+        q_near.neighbors.append(q_new)
+        q_new.neighbors.append(q_near)
+        graph.append(q_new)
         ######### Your code ends here #########
 
     def generate_plan(self, start: POSITION_TYPE, goal: POSITION_TYPE) -> Tuple[List[POSITION_TYPE], List[Node]]:
@@ -184,15 +212,76 @@ class RrtPlanner:
 
         # Find path from start to goal location through tree
         ######### Your code starts here #########
+        K = 5000  # number of iterations — vary for demos
 
+        for i in range(K):
+            q_rand = self._randomly_sample_q()
+            self._extend(graph, q_rand)
 
+            # check if the newest node reached the goal
+            if len(graph) > 1:
+                newest = graph[-1]
+                if newest.distance_to(goal_node) < self.goal_threshold:
+                    # backtrack through parents to extract path
+                    current = newest
+                    while current is not None:
+                        plan.append(current.to_dict())
+                        current = current.parent
+                    plan.reverse()
+                    plan.append({"x": goal["x"], "y": goal["y"]})
+                    print(f"Path found after {i + 1} iterations!")
+                    return plan, graph
+
+        print("No path found within iteration limit.")
         ######### Your code ends here #########
         return plan, graph
 
 
 # Protip: copy the ObstacleFreeWaypointController class from lab5.py here
 ######### Your code starts here #########
+class ObstacleFreeWaypointController:
+    def __init__(self, waypoints):
+        self.waypoints = waypoints
+        self.current_wp_index = 0
+        self.cmd_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
+        self.odom_sub = rospy.Subscriber("/odom", Odometry, self._odom_callback)
+        self.current_pose = None
+        self.linear_pid = PIDController(kP=0.5, kI=0.0, kD=0.1, kS=10, u_min=0.0, u_max=0.2)
+        self.angular_pid = PIDController(kP=1.0, kI=0.0, kD=0.1, kS=10, u_min=-1.5, u_max=1.5)
 
+    def _odom_callback(self, msg):
+        self.current_pose = msg.pose.pose
+
+    def control_robot(self):
+        if self.current_pose is None or self.current_wp_index >= len(self.waypoints):
+            return
+
+        wp = self.waypoints[self.current_wp_index]
+        x = self.current_pose.position.x
+        y = self.current_pose.position.y
+        quat = self.current_pose.orientation
+        _, _, theta = euler_from_quaternion([quat.x, quat.y, quat.z, quat.w])
+
+        dx = wp["x"] - x
+        dy = wp["y"] - y
+        dist = sqrt(dx**2 + dy**2)
+
+        if dist < GOAL_THRESHOLD:
+            self.current_wp_index += 1
+            if self.current_wp_index >= len(self.waypoints):
+                self.cmd_pub.publish(Twist())
+                print("Goal reached!")
+            return
+
+        desired_angle = atan2(dy, dx)
+        angle_err = desired_angle - theta
+        angle_err = atan2(np.sin(angle_err), np.cos(angle_err))
+
+        t = time()
+        twist = Twist()
+        twist.angular.z = self.angular_pid.control(angle_err, t)
+        twist.linear.x = self.linear_pid.control(dist, t) if abs(angle_err) < pi / 4 else 0.0
+        self.cmd_pub.publish(twist)
 ######### Your code ends here #########
 
 
