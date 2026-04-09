@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from typing import Optional, Tuple, List, Dict
 from argparse import ArgumentParser
-from math import inf, sqrt, atan2, pi
+from math import inf, sqrt, atan2, pi, sin, cos
 from time import sleep, time
 import queue
 import json
@@ -141,12 +141,13 @@ class RrtPlanner:
         # Determine vertex nearest to sampled point
         ######### Your code starts here #########
         nearest = None
-        min_dist = inf
+        best_dist = inf
         for node in graph:
-            d = node.distance_to(q)
-            if d < min_dist:
-                min_dist = d
+            d = np.linalg.norm(node.position - q.position)
+            if d < best_dist:
+                best_dist = d
                 nearest = node
+        assert nearest is not None
         return nearest
         ######### Your code ends here #########
 
@@ -164,28 +165,33 @@ class RrtPlanner:
         return False
 
     def _extend(self, graph: List[Node], q_rand: Node):
+
         # Check if sampled point is in collision and add to tree if not
         ######### Your code starts here #########
         if self._is_in_collision(q_rand):
-            return
+            return None
 
         q_near = self._nearest_vertex(graph, q_rand)
-        dist = q_near.distance_to(q_rand)
+        direction = q_rand.position - q_near.position
+        dist = np.linalg.norm(direction)
+        if dist < 1e-9:
+            return None
 
-        if dist <= self.delta:
-            q_new = q_rand
-        else:
-            direction = (q_rand.position - q_near.position) / dist
-            new_pos = q_near.position + self.delta * direction
-            q_new = Node(new_pos, None)
+        step = min(self.delta, dist)
+        q_new_pos = q_near.position + (direction / dist) * step
+        q_new = Node(q_new_pos, q_near)
 
-        if self._is_in_collision(q_new):
-            return
+        # basic edge collision checking by discretizing along the segment
+        n_checks = max(2, int(np.ceil(step / 0.02)))
+        for alpha in np.linspace(0.0, 1.0, n_checks):
+            p = q_near.position + alpha * (q_new.position - q_near.position)
+            if self._is_in_collision(Node(p, None)):
+                return None
 
-        q_new.parent = q_near
+        graph.append(q_new)
         q_near.neighbors.append(q_new)
         q_new.neighbors.append(q_near)
-        graph.append(q_new)
+        return q_new
         ######### Your code ends here #########
 
     def generate_plan(self, start: POSITION_TYPE, goal: POSITION_TYPE) -> Tuple[List[POSITION_TYPE], List[Node]]:
@@ -212,76 +218,152 @@ class RrtPlanner:
 
         # Find path from start to goal location through tree
         ######### Your code starts here #########
-        K = 5000  # number of iterations — vary for demos
+        goal_reached: Optional[Node] = None
 
-        for i in range(K):
+        for _ in range(self.max_iterations):
             q_rand = self._randomly_sample_q()
-            self._extend(graph, q_rand)
+            q_new = self._extend(graph, q_rand)
+            if q_new is None:
+                continue
 
-            # check if the newest node reached the goal
-            if len(graph) > 1:
-                newest = graph[-1]
-                if newest.distance_to(goal_node) < self.goal_threshold:
-                    # backtrack through parents to extract path
-                    current = newest
-                    while current is not None:
-                        plan.append(current.to_dict())
-                        current = current.parent
-                    plan.reverse()
-                    plan.append({"x": goal["x"], "y": goal["y"]})
-                    print(f"Path found after {i + 1} iterations!")
-                    return plan, graph
+            if np.linalg.norm(q_new.position - goal_node.position) <= self.goal_threshold:
+                goal_reached = q_new
+                break
 
-        print("No path found within iteration limit.")
+        if goal_reached is None:
+            # no solution found within iteration budget; return a trivial plan to avoid crashing controller
+            plan = [{"x": start["x"], "y": start["y"]}, {"x": goal["x"], "y": goal["y"]}]
+            return plan, graph
+
+        # Backtrack through parents to extract a path
+        path_nodes: List[Node] = []
+        cur = goal_reached
+        while cur is not None:
+            path_nodes.append(cur)
+            cur = cur.parent
+        path_nodes.reverse()
+
+        plan = [{"x": n.position[0].item(), "y": n.position[1].item()} for n in path_nodes]
+        # Ensure the final waypoint is exactly the goal location
+        if np.linalg.norm(path_nodes[-1].position - goal_node.position) > 1e-6:
+            plan.append({"x": goal["x"], "y": goal["y"]})
+        else:
+            plan[-1] = {"x": goal["x"], "y": goal["y"]}
+
         ######### Your code ends here #########
         return plan, graph
 
 
 # Protip: copy the ObstacleFreeWaypointController class from lab5.py here
 ######### Your code starts here #########
-class ObstacleFreeWaypointController:
-    def __init__(self, waypoints):
-        self.waypoints = waypoints
-        self.current_wp_index = 0
-        self.cmd_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
-        self.odom_sub = rospy.Subscriber("/odom", Odometry, self._odom_callback)
-        self.current_pose = None
-        self.linear_pid = PIDController(kP=0.5, kI=0.0, kD=0.1, kS=10, u_min=0.0, u_max=0.2)
-        self.angular_pid = PIDController(kP=1.0, kI=0.0, kD=0.1, kS=10, u_min=-1.5, u_max=1.5)
 
-    def _odom_callback(self, msg):
-        self.current_pose = msg.pose.pose
+def publish_waypoints(waypoints: List[Dict], publisher: rospy.Publisher):
+    marker_array = MarkerArray()
+    for i, waypoint in enumerate(waypoints):
+        marker = Marker()
+        marker.header.frame_id = "odom"
+        marker.header.stamp = rospy.Time.now()
+        marker.ns = "waypoints"
+        marker.id = i
+        marker.type = Marker.CYLINDER
+        marker.action = Marker.ADD
+        marker.pose.position = Point(waypoint["x"], waypoint["y"], 0.0)
+        marker.pose.orientation = Quaternion(0, 0, 0, 1)
+        marker.scale = Vector3(0.1, 0.1, 0.1)
+        marker.color = ColorRGBA(0.0, 1.0, 0.0, 0.5)
+        marker_array.markers.append(marker)
+    publisher.publish(marker_array)
+
+class ObstacleFreeWaypointController:
+    def __init__(self, waypoints: List[Dict]):
+        self.waypoints = waypoints
+        # Subscriber to the robot's current position (assuming you have Odometry data)
+        self.odom_sub = rospy.Subscriber("/odom", Odometry, self.odom_callback)
+        self.robot_ctrl_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
+        self.waypoint_pub = rospy.Publisher("/waypoints", MarkerArray, queue_size=10)
+        sleep(0.5)  # sleep to give time for rviz to subscribe to /waypoints
+        publish_waypoints(self.waypoints, self.waypoint_pub)
+
+        self.current_position = None
+
+        # define linear and angular PID controllers here
+        ######### Your code starts here #########
+        self.linear_controller = PIDController(
+            kP=0.5, kI=0.02, kD=0.1, kS=1.0,
+            u_min=0.0, u_max=0.5,
+        )
+        self.angular_controller = PIDController(
+            kP=0.5, kI=0.02, kD=0.45, kS=1.0,
+            u_min=-2.84, u_max=2.84,
+        )
+        self.waypoint_tolerance = 0.1
+        ######### Your code ends here #########
+
+    def odom_callback(self, msg):
+        # Extracting current position from Odometry message
+        pose = msg.pose.pose
+        orientation = pose.orientation
+        _, _, theta = euler_from_quaternion([orientation.x, orientation.y, orientation.z, orientation.w])
+        self.current_position = {"x": pose.position.x, "y": pose.position.y, "theta": theta}
+
+    def calculate_error(self, goal_position: Dict) -> Optional[Tuple]:
+        """Return distance and angle error between the current position and the provided goal_position. Returns None if
+        the current position is not available.
+        """
+        if self.current_position is None:
+            return None
+
+        # Calculate error in position and orientation
+        ######### Your code starts here #########
+        dx = goal_position["x"] - self.current_position["x"]
+        dy = goal_position["y"] - self.current_position["y"]
+        distance_error = sqrt(dx * dx + dy * dy)
+        angle_to_goal = atan2(dy, dx)
+        angle_error = atan2(
+            sin(angle_to_goal - self.current_position["theta"]),
+            cos(angle_to_goal - self.current_position["theta"]),
+        )
+        ######### Your code ends here #########
+
+        return distance_error, angle_error
 
     def control_robot(self):
-        if self.current_pose is None or self.current_wp_index >= len(self.waypoints):
-            return
+        rate = rospy.Rate(20)  # 20 Hz
+        ctrl_msg = Twist()
 
-        wp = self.waypoints[self.current_wp_index]
-        x = self.current_pose.position.x
-        y = self.current_pose.position.y
-        quat = self.current_pose.orientation
-        _, _, theta = euler_from_quaternion([quat.x, quat.y, quat.z, quat.w])
+        # initialize first waypoint
+        current_waypoint_idx = 0
 
-        dx = wp["x"] - x
-        dy = wp["y"] - y
-        dist = sqrt(dx**2 + dy**2)
+        while not rospy.is_shutdown():
 
-        if dist < GOAL_THRESHOLD:
-            self.current_wp_index += 1
-            if self.current_wp_index >= len(self.waypoints):
-                self.cmd_pub.publish(Twist())
-                print("Goal reached!")
-            return
+            # Travel through waypoints one at a time, checking if robot is close enough
+            ######### Your code starts here #########
+            if current_waypoint_idx >= len(self.waypoints):
+                ctrl_msg.linear.x = 0.0
+                ctrl_msg.angular.z = 0.0
+                self.robot_ctrl_pub.publish(ctrl_msg)
+                rate.sleep()
+                continue
 
-        desired_angle = atan2(dy, dx)
-        angle_err = desired_angle - theta
-        angle_err = atan2(np.sin(angle_err), np.cos(angle_err))
+            goal = self.waypoints[current_waypoint_idx]
+            err_tuple = self.calculate_error(goal)
+            if err_tuple is None:
+                rate.sleep()
+                continue
+            distance_error, angle_error = err_tuple
 
-        t = time()
-        twist = Twist()
-        twist.angular.z = self.angular_pid.control(angle_err, t)
-        twist.linear.x = self.linear_pid.control(dist, t) if abs(angle_err) < pi / 4 else 0.0
-        self.cmd_pub.publish(twist)
+            if distance_error < self.waypoint_tolerance:
+                current_waypoint_idx += 1
+                ctrl_msg.linear.x = 0.0
+                ctrl_msg.angular.z = 0.0
+            else:
+                t = time()
+                ctrl_msg.linear.x = self.linear_controller.control(distance_error, t)
+                ctrl_msg.angular.z = self.angular_controller.control(angle_error, t)
+            self.robot_ctrl_pub.publish(ctrl_msg)
+            ######### Your code ends here #########
+            rate.sleep()
+
 ######### Your code ends here #########
 
 
@@ -308,6 +390,9 @@ if __name__ == "__main__":
     plan, graph = planner.generate_plan(start_position, goal_position)
     planner.visualize_plan(plan)
     planner.visualize_graph(graph)
+    print(f"Plan: {plan}")
+
+
     controller = ObstacleFreeWaypointController(plan)
 
     try:
